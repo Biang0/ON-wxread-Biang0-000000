@@ -1,5 +1,4 @@
 # main.py 主逻辑：包括字段拼接、模拟请求
-import re
 import json
 import time
 import random
@@ -7,43 +6,51 @@ import logging
 import hashlib
 import requests
 import urllib.parse
+import os  # 读取环境变量
+from config import get_book_info, REQUEST_DATA, HEADERS, COOKIES, PUSH_METHOD, READ_NUM
 from push import push
-from config import data, headers, cookies, READ_NUM, PUSH_METHOD
 
-# 配置日志格式
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)-8s - %(message)s",
+    handlers=[logging.FileHandler("wechat_read.log"), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)-8s - %(message)s')
 
-# 加密盐及其它默认值
-KEY = "3c5c8717f3daf09iop3423zafeqoi"
-COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread"}
+# API 地址
 READ_URL = "https://weread.qq.com/web/book/read"
 RENEW_URL = "https://weread.qq.com/web/login/renewal"
+KEY = "your_secret_key_here"  # 请在此处配置你的密钥
 
 
-def encode_data(data):
-    """数据编码"""
-    return '&'.join(f"{k}={urllib.parse.quote(str(data[k]), safe='')}" for k in sorted(data.keys()))
+def get_beijing_time():
+    """获取北京时间"""
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + 8 * 3600))
 
 
-def cal_hash(input_string):
-    """计算哈希值"""
+def encode_data(params: dict) -> str:
+    """对参数进行 URL 编码"""
+    return "&".join([f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted(params.items())])
+
+
+def calculate_hash(data: str) -> str:
+    """计算自定义哈希值"""
     _7032f5 = 0x15051505
     _cc1055 = _7032f5
-    length = len(input_string)
-    _19094e = length - 1
-
-    while _19094e > 0:
-        _7032f5 = 0x7fffffff & (_7032f5 ^ ord(input_string[_19094e]) << (length - _19094e) % 30)
-        _cc1055 = 0x7fffffff & (_cc1055 ^ ord(input_string[_19094e - 1]) << _19094e % 30)
-        _19094e -= 2
-
+    length = len(data)
+    index = length - 1
+    while index > 0:
+        _7032f5 = (_7032f5 ^ (ord(data[index]) << ((length - index) % 30))) & 0x7FFFFFFF
+        _cc1055 = (_cc1055 ^ (ord(data[index - 1]) << (index % 30))) & 0x7FFFFFFF
+        index -= 2
     return hex(_7032f5 + _cc1055)[2:].lower()
 
 
 def get_wr_skey():
-    """刷新cookie密钥"""
-    response = requests.post(RENEW_URL, headers=headers, cookies=cookies,
+    """刷新 cookie 密钥"""
+    COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread"}
+    response = requests.post(RENEW_URL, headers=HEADERS, cookies=COOKIES,
                              data=json.dumps(COOKIE_DATA, separators=(',', ':')))
     for cookie in response.headers.get('Set-Cookie', '').split(';'):
         if "wr_skey" in cookie:
@@ -51,39 +58,91 @@ def get_wr_skey():
     return None
 
 
-index = 1
-while index <= READ_NUM:
-    data['ct'] = int(time.time())
-    data['ts'] = int(time.time() * 1000)
-    data['rn'] = random.randint(0, 1000)
-    data['sg'] = hashlib.sha256(f"{data['ts']}{data['rn']}{KEY}".encode()).hexdigest()
-    data['s'] = cal_hash(encode_data(data))
+def main():
+    # 获取选定书籍，并更新请求数据中的 b 值
+    selected_book, selected_b = get_book_info()
+    REQUEST_DATA["b"] = selected_b
 
-    logging.info(f"⏱️ 尝试第 {index} 次阅读...")
-    response = requests.post(READ_URL, headers=headers, cookies=cookies, data=json.dumps(data, separators=(',', ':')))
-    resData = response.json()
+    # logger.info(f"🎯 选定书籍: {selected_book} (b值: {selected_b})")
+    total_read_time = 0.0
+    index = 1
 
-    if 'succ' in resData:
-        index += 1
-        time.sleep(30)
-        logging.info(f"✅ 阅读成功，阅读进度：{(index - 1) * 0.5} 分钟")
+    while index <= READ_NUM:
+        try:
+            # 读取 READ_COMPLETE_HEADER，若为空则使用默认值
+            READ_COMPLETE_HEADER = os.getenv("READ_COMPLETE_HEADER") or "🎉 微信阅读已完成！"
 
-    else:
-        logging.warning("❌ cookie 已过期，尝试刷新...")
-        new_skey = get_wr_skey()
-        if new_skey:
-            cookies['wr_skey'] = new_skey
-            logging.info(f"✅ 密钥刷新成功，新密钥：{new_skey}")
-            logging.info(f"🔄 重新本次阅读。")
-        else:
-            ERROR_CODE = "❌ 无法获取新密钥或者WXREAD_CURL_BASH配置有误，终止运行。"
-            logging.error(ERROR_CODE)
-            push(ERROR_CODE, PUSH_METHOD)
-            raise Exception(ERROR_CODE)
-    data.pop('s')
+            # 更新动态参数
+            REQUEST_DATA["ct"] = int(time.time())
+            REQUEST_DATA["ts"] = int(time.time() * 1000)
+            REQUEST_DATA["rn"] = random.randint(0, 1000)
+            REQUEST_DATA["sg"] = hashlib.sha256(f"{REQUEST_DATA['ts']}{REQUEST_DATA['rn']}{KEY}".encode()).hexdigest()
+            REQUEST_DATA["s"] = calculate_hash(encode_data(REQUEST_DATA))
 
-logging.info("🎉 阅读脚本已完成！")
+            logger.info(f"⏱️ 尝试第 {index} 次阅读...")
+            response = requests.post(
+                READ_URL,
+                headers=HEADERS,
+                cookies=COOKIES,
+                data=json.dumps(REQUEST_DATA, separators=(",", ":")),
+            )
+            resData = response.json()
 
-if PUSH_METHOD not in (None, ''):
-    logging.info("⏱️ 开始推送...")
-    push(f"🎉 微信读书自动阅读完成！\n⏱️ 阅读时长：{(index - 1) * 0.5}分钟。", PUSH_METHOD)
+            if 'succ' in resData:
+                total_read_time += 0.5
+                index += 1
+                time.sleep(30)  # 每次阅读间隔 30 秒
+                logger.info(f"✅ 阅读成功，当前累计进度：{total_read_time:.1f} 分钟")
+            else:
+                logger.warning("❌ Cookie 可能已过期，尝试刷新...")
+                new_skey = get_wr_skey()
+                if new_skey:
+                    COOKIES['wr_skey'] = new_skey
+                    logger.info(f"✅ 密钥刷新成功，新密钥：{new_skey}")
+                    logger.info("🔄 重新尝试本次阅读。")
+                else:
+                    ERROR_CODE = "❌ 无法获取新密钥，终止运行。"
+                    logger.error(ERROR_CODE)
+                    push(ERROR_CODE, PUSH_METHOD)
+                    raise Exception(ERROR_CODE)
+            REQUEST_DATA.pop('s')
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ 网络请求失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"❌ 发生未知错误: {str(e)}")
+            break
+
+    logger.info("🎉 阅读任务完成！")
+
+    # 发送推送通知
+    if PUSH_METHOD:
+        try:
+            message = (
+                f"{READ_COMPLETE_HEADER}\n\n"
+                f"📚 书籍：《{selected_book}》\n"
+                f"⏱️ 阅读时长：{total_read_time:.1f} 分钟\n"
+                f"📅 完成时间：{get_beijing_time()}"
+            )
+            push(message, PUSH_METHOD)
+            logger.info(f"✅ 推送成功: {READ_COMPLETE_HEADER}")
+        except Exception as e:
+            logger.error(f"❌ 推送失败: {str(e)}")
+
+    # 记录运行数据到文件
+    log_path = "log.md"  # 修改日志路径和格式
+    try:
+        with open(log_path, "a", encoding="utf-8") as file:
+            file.write(f"## 运行记录\n")
+            file.write(f"### 运行时间: {get_beijing_time()}\n")
+            file.write(f"- **选定书籍**: 《{selected_book}》\n")
+            file.write(f"- **阅读时长**: {total_read_time:.1f} 分钟\n")
+            file.write(f"{'---' * 10}\n")  # Markdown 分隔线
+        logger.info(f"✅ 运行数据已记录到 {log_path}")
+    except Exception as e:
+        logger.error(f"❌ 记录运行数据失败: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
